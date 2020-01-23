@@ -1,10 +1,14 @@
 package main
 
 import (
+	crand "crypto/rand"
 	"crypto/sha256"
+	"crypto/elliptic"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -13,8 +17,10 @@ import (
 	"strings"
 	"fmt"
 	"strconv"
-	"math/rand"
-	
+	rand "math/rand"
+	"math/big"
+	"encoding/asn1"
+
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -22,6 +28,59 @@ import (
 
 const difficulty = 4
 
+type Transaction struct {
+	Number		string
+	Input		inputList
+	Output		outputList
+	Signature 	string
+}
+
+type Transactions []Transaction
+
+
+type TransactionOutput struct {
+	PublicKey 	string
+	Hostname	string
+	IpAddr	string
+}
+
+type outputList []TransactionOutput
+
+func (outputs outputList) OutputString() string {
+	var outputString string
+	for _,output := range outputs {
+		outputString += output.PublicKey
+		outputString += output.Hostname
+		outputString += output.IpAddr
+	}
+	return outputString
+}
+
+type TransactionInput struct {
+	Number	string
+	Outputs outputList
+}
+
+type inputList []TransactionInput
+
+func (inputs inputList) InputString() string {
+	var inputString string
+	for _,input := range inputs {
+		inputString += input.Number
+		inputString += input.Outputs.OutputString()
+	}
+
+	return inputString	
+}
+
+type Wallet struct {
+	privateKey 		*ecdsa.PrivateKey
+	publicKeyBytes  []byte
+}
+
+type ECDSASignature struct {
+	R, S *big.Int
+}
 
 type DNSServer struct {
 	IpAddr string
@@ -39,12 +98,11 @@ type DNSListAddition struct {
 }
 
 type Block struct {
-	Index     int
-	Timestamp string
-	Hostname  string
-	IpAddr	  string
-	Hash      string
-	PrevHash  string
+	Index      int
+	Timestamp  string
+	Tx		   Transaction
+	Hash       string
+	PrevHash   string
 	Difficulty int
 	Nonce 	   float64
 }
@@ -53,6 +111,63 @@ var Blockchain []Block
 var DNSServerList []DNSServer
 var DNSTxList []DNSTx
 
+func (tx Transaction) RetrievePublicKey() *ecdsa.PublicKey {
+	keyString := tx.Input[0].Outputs[0].PublicKey
+	keyBytes, err := hex.DecodeString(keyString)
+	if err != nil {
+		panic(err)
+	}
+	x,y := elliptic.Unmarshal(elliptic.P256(), keyBytes)
+	var VerifyKey = &ecdsa.PublicKey{
+		elliptic.P256(), x, y,
+	}
+	return VerifyKey
+}
+
+func (w Wallet) GetPublicString() string {
+	publicKeyString := hex.EncodeToString(w.publicKeyBytes)
+	return publicKeyString
+}
+
+func CreateWallet() (Wallet,error) {
+	var w Wallet	
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		return Wallet{},err
+	}
+	w.privateKey = priv
+	w.publicKeyBytes = elliptic.Marshal(priv.PublicKey, priv.PublicKey.X, priv.PublicKey.Y)
+	//fmt.Println(w.publicKeyBytes)
+	return w,nil
+}
+
+func (tx Transaction) ValidateTransaction() (bool) {
+	signatureString := tx.Signature
+	signatureBytes,err := hex.DecodeString(signatureString)
+	if err != nil {
+		panic(err)
+	}
+	signature := ECDSASignature{}
+	_,err = asn1.Unmarshal(signatureBytes, &signature)
+
+	hash, err := hex.DecodeString(tx.Number)
+
+	verificationKey := tx.RetrievePublicKey()
+	valid := ecdsa.Verify(verificationKey, hash[:], signature.R, signature.S)
+	return valid
+}
+
+
+func (tx Transaction) TransactionString() string {
+	var txString string
+	txString += tx.Number
+	txString += tx.Input.InputString()
+	txString += tx.Output.OutputString()
+	txString += tx.Signature 
+	return txString
+}
+
+/*
 func hashing_routine(id int, block Block ,results chan<- string) {
 	fmt.Println("Hasher", id, "is hashing now") 
 	record := string(block.Index) + block.Timestamp + block.Hostname + block.IpAddr + block.PrevHash + strconv.Itoa(block.Difficulty)
@@ -71,11 +186,11 @@ func hashing_routine(id int, block Block ,results chan<- string) {
 		}
 	}
 }
-
+*/
 
 func calculateHash(block Block) string {
 	str_nonce := fmt.Sprintf("%x", block.Nonce)
-	record := string(block.Index) + block.Timestamp + block.Hostname + block.IpAddr + block.PrevHash + strconv.Itoa(block.Difficulty) + str_nonce
+	record := string(block.Index) + block.Timestamp + block.Tx.TransactionString() + block.PrevHash + strconv.Itoa(block.Difficulty) + str_nonce
 	h := sha256.New()
 	h.Write([]byte(record))
 	hashed := h.Sum(nil)
@@ -89,7 +204,7 @@ func isHashValid(hash string, difficulty int) bool {
 
 
 
-func generateBlock(oldBlock Block, Hostname, IpAddr string) (Block, error) {
+func generateBlock(oldBlock Block, tx Transaction) (Block, error) {
 
 	var newBlock Block
 
@@ -97,9 +212,7 @@ func generateBlock(oldBlock Block, Hostname, IpAddr string) (Block, error) {
 
 	newBlock.Index = oldBlock.Index + 1
 	newBlock.Timestamp = t.String()
-	newBlock.Hostname = Hostname
-	newBlock.IpAddr = IpAddr 
-	
+	newBlock.Tx = tx
 	newBlock.PrevHash = oldBlock.Hash
 	newBlock.Difficulty = difficulty
 
@@ -254,16 +367,24 @@ func handleLength(w http.ResponseWriter, r *http.Request) {
 
 
 func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
-	var m DNSTx
+	var m Transaction
 
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&m); err != nil {
+
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		panic(err)
+	}
+	if _,err := asn1.Unmarshal(bodyBytes, &m); err != nil {
 		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
 		return
 	}
 	defer r.Body.Close()
 
-	newBlock, err := generateBlock(Blockchain[len(Blockchain)-1], m.Hostname, m.IpAddr)
+	if m.ValidateTransaction() != true {
+		return
+	}
+
+	newBlock, err := generateBlock(Blockchain[len(Blockchain)-1], m)
 	if err != nil {
 		respondWithJSON(w, r, http.StatusInternalServerError, m)
 		return
@@ -318,6 +439,23 @@ func handleDNSUpdate(w http.ResponseWriter, r *http.Request) {
 	spew.Dump(DNSServerList)
 }
 
+func GenesisTransaction(ietf Wallet) Transaction {
+	var gtx Transaction
+	gtx.Input = []TransactionInput{} 
+	gtx.Output = []TransactionOutput{
+		TransactionOutput{ietf.GetPublicString(),".com","9.9.9.9"},
+		TransactionOutput{ietf.GetPublicString(),".gov","8.8.8.8"},
+		TransactionOutput{ietf.GetPublicString(),".org","7.7.7.7"},
+	}
+	msg := gtx.Input.InputString() + gtx.Output.OutputString()
+	hash := sha256.Sum256([]byte(msg))
+	gtx.Number = hex.EncodeToString(hash[:])
+	gtx.Signature = ""
+	return gtx
+}
+
+
+
 
 func makeMuxRouter() http.Handler {
 	muxRouter := mux.NewRouter()
@@ -337,9 +475,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	IETF, err := CreateWallet()
+	if err != nil {
+		panic(err)
+	}
+
 	go func() {
 		t := time.Now()
-		genesisBlock := Block{0, t.String(), "www.insight.com", "1.1.1.1", "", "",difficulty,0}
+		genesisBlock := Block{0, t.String(), GenesisTransaction(IETF), "", "",difficulty,0.0}
 		spew.Dump(genesisBlock)
 		Blockchain = append(Blockchain, genesisBlock)
 
