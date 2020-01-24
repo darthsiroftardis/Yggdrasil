@@ -1,26 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	crand "crypto/rand"
 	"crypto/sha256"
-	"crypto/elliptic"
-	"crypto/ecdsa"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/big"
+	rand "math/rand"
 	"net/http"
 	"os"
-	"time"
-	"bytes"
-	"strings"
-	"fmt"
 	"strconv"
-	rand "math/rand"
-	"math/big"
-	"encoding/asn1"
+	"strings"
+	"time"
 
+	"github.com/cbergoon/merkletree"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -28,27 +29,38 @@ import (
 
 const difficulty = 4
 
+var blockChainMerkleTree *merkletree.MerkleTree
+var merkleList []merkletree.Content
+
+type DNSQuery struct {
+	Hostname string
+}
+
+type DNSResponse struct {
+	Resolution TransactionOutput
+	HashList   []string
+}
+
 type Transaction struct {
-	Number		string
-	Input		inputList
-	Output		outputList
-	Signature 	string
+	Number    string
+	Input     inputList
+	Output    outputList
+	Signature string
 }
 
 type Transactions []Transaction
 
-
 type TransactionOutput struct {
-	PublicKey 	string
-	Hostname	string
-	IpAddr	string
+	PublicKey string
+	Hostname  string
+	IpAddr    string
 }
 
 type outputList []TransactionOutput
 
 func (outputs outputList) OutputString() string {
 	var outputString string
-	for _,output := range outputs {
+	for _, output := range outputs {
 		outputString += output.PublicKey
 		outputString += output.Hostname
 		outputString += output.IpAddr
@@ -57,7 +69,7 @@ func (outputs outputList) OutputString() string {
 }
 
 type TransactionInput struct {
-	Number	string
+	Number  string
 	Outputs outputList
 }
 
@@ -65,17 +77,17 @@ type inputList []TransactionInput
 
 func (inputs inputList) InputString() string {
 	var inputString string
-	for _,input := range inputs {
+	for _, input := range inputs {
 		inputString += input.Number
 		inputString += input.Outputs.OutputString()
 	}
 
-	return inputString	
+	return inputString
 }
 
 type Wallet struct {
-	privateKey 		*ecdsa.PrivateKey
-	publicKeyBytes  []byte
+	privateKey     *ecdsa.PrivateKey
+	publicKeyBytes []byte
 }
 
 type ECDSASignature struct {
@@ -83,33 +95,72 @@ type ECDSASignature struct {
 }
 
 type DNSServer struct {
-	IpAddr string
+	IpAddr    string
 	PublicKey string
 }
 
 type DNSTx struct {
 	Hostname string
-	IpAddr string
+	IpAddr   string
+}
+
+type DNSEntry struct {
+	Hostname  string
+	DNSOutput TransactionOutput
 }
 
 type DNSListAddition struct {
-	IpAddr string
+	IpAddr    string
 	PublicKey string
 }
 
 type Block struct {
 	Index      int
 	Timestamp  string
-	Tx		   Transaction
+	Tx         Transaction
 	Hash       string
 	PrevHash   string
 	Difficulty int
-	Nonce 	   float64
+	Nonce      float64
 }
 
 var Blockchain []Block
 var DNSServerList []DNSServer
 var DNSTxList []DNSTx
+
+func (txOp TransactionOutput) IsEqual(otherTx TransactionOutput) bool {
+	if txOp.Hostname != otherTx.Hostname {
+		return false
+	}
+
+	if txOp.PublicKey != otherTx.PublicKey {
+		return false
+	}
+
+	if txOp.IpAddr != otherTx.IpAddr {
+		return false
+	}
+
+	return true
+}
+
+func (txOp TransactionOutput) TxOutputString() string {
+	var txOutputString string
+	txOutputString = txOp.PublicKey + txOp.Hostname + txOp.IpAddr
+	return txOutputString
+}
+
+func (dns DNSEntry) CalculateHash() ([]byte, error) {
+	h := sha256.New()
+	if _, err := h.Write([]byte(dns.Hostname + dns.DNSOutput.TxOutputString())); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+func (dns DNSEntry) Equals(other merkletree.Content) (bool, error) {
+	return (dns.Hostname == other.(DNSEntry).Hostname && dns.DNSOutput.IsEqual(other.(DNSEntry).DNSOutput)), nil
+}
 
 func (tx Transaction) RetrievePublicKey() *ecdsa.PublicKey {
 	keyString := tx.Input[0].Outputs[0].PublicKey
@@ -117,11 +168,16 @@ func (tx Transaction) RetrievePublicKey() *ecdsa.PublicKey {
 	if err != nil {
 		panic(err)
 	}
-	x,y := elliptic.Unmarshal(elliptic.P256(), keyBytes)
+	x, y := elliptic.Unmarshal(elliptic.P256(), keyBytes)
 	var VerifyKey = &ecdsa.PublicKey{
 		elliptic.P256(), x, y,
 	}
 	return VerifyKey
+}
+
+func CreateMerkleTree() {
+	blockChainMerkleTree, _ = merkletree.NewTree(merkleList)
+	spew.Dump(blockChainMerkleTree)
 }
 
 func (w Wallet) GetPublicString() string {
@@ -129,26 +185,26 @@ func (w Wallet) GetPublicString() string {
 	return publicKeyString
 }
 
-func CreateWallet() (Wallet,error) {
-	var w Wallet	
+func CreateWallet() (Wallet, error) {
+	var w Wallet
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
 	if err != nil {
-		return Wallet{},err
+		return Wallet{}, err
 	}
 	w.privateKey = priv
 	w.publicKeyBytes = elliptic.Marshal(priv.PublicKey, priv.PublicKey.X, priv.PublicKey.Y)
 	//fmt.Println(w.publicKeyBytes)
-	return w,nil
+	return w, nil
 }
 
-func (tx Transaction) ValidateTransaction() (bool) {
+func (tx Transaction) ValidateTransaction() bool {
 	signatureString := tx.Signature
-	signatureBytes,err := hex.DecodeString(signatureString)
+	signatureBytes, err := hex.DecodeString(signatureString)
 	if err != nil {
 		panic(err)
 	}
 	signature := ECDSASignature{}
-	_,err = asn1.Unmarshal(signatureBytes, &signature)
+	_, err = asn1.Unmarshal(signatureBytes, &signature)
 
 	hash, err := hex.DecodeString(tx.Number)
 
@@ -157,19 +213,18 @@ func (tx Transaction) ValidateTransaction() (bool) {
 	return valid
 }
 
-
 func (tx Transaction) TransactionString() string {
 	var txString string
 	txString += tx.Number
 	txString += tx.Input.InputString()
 	txString += tx.Output.OutputString()
-	txString += tx.Signature 
+	txString += tx.Signature
 	return txString
 }
 
 /*
 func hashing_routine(id int, block Block ,results chan<- string) {
-	fmt.Println("Hasher", id, "is hashing now") 
+	fmt.Println("Hasher", id, "is hashing now")
 	record := string(block.Index) + block.Timestamp + block.Hostname + block.IpAddr + block.PrevHash + strconv.Itoa(block.Difficulty)
 	h := sha256.New()
 	for {
@@ -201,8 +256,6 @@ func isHashValid(hash string, difficulty int) bool {
 	prefix := strings.Repeat("0", difficulty)
 	return strings.HasPrefix(hash, prefix)
 }
-
-
 
 func generateBlock(oldBlock Block, tx Transaction) (Block, error) {
 
@@ -263,7 +316,7 @@ func checkDNSEntry(Server DNSServer) bool {
 }
 
 func addDNSList(newDNSEntries []DNSServer) {
-	for _,entry := range newDNSEntries {
+	for _, entry := range newDNSEntries {
 		if checkDNSEntry(entry) {
 			DNSServerList = append(DNSServerList, entry)
 		}
@@ -275,9 +328,8 @@ func AddDns(IpAddr, PublicKey string) (DNSServer, error) {
 
 	newDNS.IpAddr = IpAddr
 	newDNS.PublicKey = PublicKey
-	return newDNS, nil 
+	return newDNS, nil
 }
-
 
 func run() error {
 	mux := makeMuxRouter()
@@ -310,7 +362,6 @@ func respondWithJSON(w http.ResponseWriter, r *http.Request, code int, payload i
 	w.Write(response)
 }
 
-
 func handleGetBlockchain(w http.ResponseWriter, r *http.Request) {
 	bytes, err := json.MarshalIndent(Blockchain, "", "  ")
 	if err != nil {
@@ -320,14 +371,13 @@ func handleGetBlockchain(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, string(bytes))
 }
 
-
 func updateDNSList() {
 	for _, servers := range DNSServerList {
-		reqBody, err := json.MarshalIndent(DNSServerList, "","	")
+		reqBody, err := json.MarshalIndent(DNSServerList, "", "	")
 		if err != nil {
 			spew.Dump(err)
 		}
-		resp, err := http.Post("http://" + servers.IpAddr + ":8080" + "/CheckDNSServerList","application/json", bytes.NewBuffer(reqBody))
+		resp, err := http.Post("http://"+servers.IpAddr+":8080"+"/CheckDNSServerList", "application/json", bytes.NewBuffer(reqBody))
 		if err != nil {
 			panic(err)
 		}
@@ -335,19 +385,16 @@ func updateDNSList() {
 	}
 }
 
-
-
 func handleBroadcast() {
-
-	for _,servers := range DNSServerList {
-			reqBody, err := json.MarshalIndent(Blockchain, "", "	")
-			if err != nil {
-				spew.Dump(err)
-			}
-			resp, err := http.Post("http://" + servers.IpAddr + ":8080" + "/CheckBlockLength","application/json", bytes.NewBuffer(reqBody))
-			if err != nil {
-				panic(err)
-			}
+	for _, servers := range DNSServerList {
+		reqBody, err := json.MarshalIndent(Blockchain, "", "	")
+		if err != nil {
+			spew.Dump(err)
+		}
+		resp, err := http.Post("http://"+servers.IpAddr+":8080"+"/CheckBlockLength", "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			panic(err)
+		}
 		log.Println(resp)
 	}
 	updateDNSList()
@@ -365,16 +412,14 @@ func handleLength(w http.ResponseWriter, r *http.Request) {
 	spew.Dump(Blockchain)
 }
 
-
 func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
 	var m Transaction
-
 
 	bodyBytes, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		panic(err)
 	}
-	if _,err := asn1.Unmarshal(bodyBytes, &m); err != nil {
+	if _, err := asn1.Unmarshal(bodyBytes, &m); err != nil {
 		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
 		return
 	}
@@ -395,21 +440,30 @@ func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
 		spew.Dump(Blockchain)
 	}
 
+	for _, output := range newBlock.Tx.Output {
+		merkleList = append(merkleList, DNSEntry{
+			output.Hostname,
+			output,
+		})
+	}
+	spew.Dump("Hi")
+	blockChainMerkleTree.RebuildTreeWith(merkleList)
+	spew.Dump(blockChainMerkleTree)
 	handleBroadcast()
 	respondWithJSON(w, r, http.StatusCreated, newBlock)
 }
 
 func handleDNSList(w http.ResponseWriter, r *http.Request) {
-	bytes, err := json.MarshalIndent(DNSServerList,"","	")
+	bytes, err := json.MarshalIndent(DNSServerList, "", "	")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return 
+		return
 	}
 	io.WriteString(w, string(bytes))
 }
 
 func handleDNSListWrite(w http.ResponseWriter, r *http.Request) {
-	var submission DNSListAddition 
+	var submission DNSListAddition
 
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&submission); err != nil {
@@ -439,13 +493,36 @@ func handleDNSUpdate(w http.ResponseWriter, r *http.Request) {
 	spew.Dump(DNSServerList)
 }
 
+func handleDNSQuery(w http.ResponseWriter, r *http.Request) {
+	var query DNSQuery
+	var response DNSResponse
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&query); err != nil {
+		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
+	}
+	for i := len(merkleList) - 1; i > 0; i-- {
+		if merkleList[i].(DNSEntry).Hostname == query.Hostname {
+			response.Resolution = merkleList[i].(DNSEntry).DNSOutput
+			paths, _, err := blockChainMerkleTree.GetMerklePath(merkleList[i])
+			if err != nil {
+				panic(err)
+			}
+			for _, path := range paths {
+				response.HashList = append(response.HashList, hex.EncodeToString(path))
+			}
+			response.HashList = append(response.HashList, hex.EncodeToString(blockChainMerkleTree.MerkleRoot()))
+		}
+	}
+	respondWithJSON(w, r, http.StatusCreated, response)
+}
+
 func GenesisTransaction(ietf Wallet) Transaction {
 	var gtx Transaction
-	gtx.Input = []TransactionInput{} 
+	gtx.Input = []TransactionInput{}
 	gtx.Output = []TransactionOutput{
-		TransactionOutput{ietf.GetPublicString(),".com","9.9.9.9"},
-		TransactionOutput{ietf.GetPublicString(),".gov","8.8.8.8"},
-		TransactionOutput{ietf.GetPublicString(),".org","7.7.7.7"},
+		TransactionOutput{ietf.GetPublicString(), ".com", "9.9.9.9"},
+		TransactionOutput{ietf.GetPublicString(), ".gov", "8.8.8.8"},
+		TransactionOutput{ietf.GetPublicString(), ".org", "7.7.7.7"},
 	}
 	msg := gtx.Input.InputString() + gtx.Output.OutputString()
 	hash := sha256.Sum256([]byte(msg))
@@ -453,9 +530,6 @@ func GenesisTransaction(ietf Wallet) Transaction {
 	gtx.Signature = ""
 	return gtx
 }
-
-
-
 
 func makeMuxRouter() http.Handler {
 	muxRouter := mux.NewRouter()
@@ -465,9 +539,9 @@ func makeMuxRouter() http.Handler {
 	muxRouter.HandleFunc("/DNSList", handleDNSListWrite).Methods("POST")
 	muxRouter.HandleFunc("/CheckBlockLength", handleLength).Methods("POST")
 	muxRouter.HandleFunc("/CheckDNSServerList", handleDNSUpdate).Methods("POST")
+	muxRouter.HandleFunc("/DNSQuery", handleDNSQuery).Methods("POST")
 	return muxRouter
 }
-
 
 func main() {
 	err := godotenv.Load()
@@ -482,11 +556,18 @@ func main() {
 
 	go func() {
 		t := time.Now()
-		genesisBlock := Block{0, t.String(), GenesisTransaction(IETF), "", "",difficulty,0.0}
+		genesisBlock := Block{0, t.String(), GenesisTransaction(IETF), "", "", difficulty, 0.0}
 		spew.Dump(genesisBlock)
 		Blockchain = append(Blockchain, genesisBlock)
+		for _, gensisOutput := range genesisBlock.Tx.Output {
+			merkleList = append(merkleList, DNSEntry{
+				gensisOutput.Hostname,
+				gensisOutput,
+			})
+		}
+		CreateMerkleTree()
 
-		selfServer := DNSServer{"127.0.0.1","Hello World"}
+		selfServer := DNSServer{"127.0.0.1", "Hello World"}
 		DNSServerList = append(DNSServerList, selfServer)
 
 	}()
