@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 	"context"
+	"sync"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -260,13 +261,80 @@ func hashing_routine(id int, block Block ,results chan<- string) {
 }
 */
 
+func gen(done <-chan struct{}, seeds ...string) <-chan string {
+	out := make(chan string, len(seeds))
+	go func() {
+		for _, n := range seeds {
+			out <- n
+		}
+		close(out)
+	}()
+	return out
+}
+
+
+
+func hashing(done <-chan struct{}, in <-chan string) <-chan float64 {
+	out := make(chan float64)
+	go func() {
+		defer close(out)
+		seed := <-in
+		log.Println("Received SEED:", seed)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			nonce := rand.Float64()
+			nonceStr := fmt.Sprintf("%x",nonce)
+			hashBytes := sha256.Sum256([]byte(seed + nonceStr))
+			hashString := hex.EncodeToString(hashBytes[:])
+			log.Println(hashString,"||",nonceStr)
+			if isHashValid(hashString, difficulty) {
+				select {
+					case out <- nonce:
+						log.Println("WINNING NONCE",nonce)
+						return
+					case <-done:return	
+				}
+			}
+		}
+	}()
+	return out
+}
+
+func merge(done <-chan struct{},cs ...<-chan float64) <-chan float64 {
+	var wg sync.WaitGroup
+	out := make(chan float64)
+	output := func(c <-chan float64) {
+		defer wg.Done()
+		for n := range c {
+			select {
+			case out <- n:
+			case <-done:
+				return
+			}
+		}
+	}
+	wg.Add(len(cs))
+	for _,c := range cs {
+		go output(c)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+
 func calculateHash(block Block) string {
+	log.Println(block.Nonce)
 	str_nonce := fmt.Sprintf("%x", block.Nonce)
 	record := string(block.Index) + block.Timestamp + block.Tx.TransactionString() + block.PrevHash + strconv.Itoa(block.Difficulty) + str_nonce
-	h := sha256.New()
-	h.Write([]byte(record))
-	hashed := h.Sum(nil)
-	return hex.EncodeToString(hashed)
+	hashBytes := sha256.Sum256([]byte(record))
+	return hex.EncodeToString(hashBytes[:])
 }
 
 func isHashValid(hash string, difficulty int) bool {
@@ -286,16 +354,30 @@ func generateBlock(oldBlock Block, tx Transaction) (Block, error) {
 	newBlock.PrevHash = oldBlock.Hash
 	newBlock.Difficulty = difficulty
 
-	for {
-		newBlock.Nonce = rand.Float64()
-		if !isHashValid(calculateHash(newBlock), newBlock.Difficulty) {
-			fmt.Println(calculateHash(newBlock), "Do more Work!")
-			continue
-		} else {
-			fmt.Println(calculateHash(newBlock), "work Done!")
-			newBlock.Hash = calculateHash(newBlock)
-			break
-		}
+	seed := string(newBlock.Index) + newBlock.Timestamp + newBlock.Tx.TransactionString() + newBlock.PrevHash + strconv.Itoa(newBlock.Difficulty)
+
+	log.Println("GENERATED SEED", seed)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	in := gen(done, seed, seed,seed, seed)
+
+
+	h1 := hashing(done, in)
+	h2 := hashing(done, in)
+	h3 := hashing(done, in)
+	h4 := hashing(done, in)
+
+	nonceChan := merge(done, h1, h2, h3, h4)
+	newBlock.Nonce = <-nonceChan
+
+
+
+	if isHashValid(calculateHash(newBlock), difficulty) {
+		newBlock.Hash = calculateHash(newBlock)	
+	} else {
+		log.Fatal("INVALID :", newBlock.Nonce, "||", calculateHash(newBlock))
 	}
 
 	return newBlock, nil
@@ -455,18 +537,21 @@ func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
 		newBlockchain := append(Blockchain, newBlock)
 		replaceChain(newBlockchain)
 		spew.Dump(Blockchain)
+			
+		for _, output := range newBlock.Tx.Output {
+			merkleList = append(merkleList, DNSEntry{
+				output.Hostname,
+				output,
+			})
+		}
+		spew.Dump("Hi")
+		blockChainMerkleTree.RebuildTreeWith(merkleList)
+		spew.Dump(blockChainMerkleTree)
+		handleBroadcast()
+
+
 	}
 
-	for _, output := range newBlock.Tx.Output {
-		merkleList = append(merkleList, DNSEntry{
-			output.Hostname,
-			output,
-		})
-	}
-	spew.Dump("Hi")
-	blockChainMerkleTree.RebuildTreeWith(merkleList)
-	spew.Dump(blockChainMerkleTree)
-	handleBroadcast()
 	respondWithJSON(w, r, http.StatusCreated, newBlock)
 }
 
