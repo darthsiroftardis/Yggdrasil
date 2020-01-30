@@ -20,6 +20,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"context"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+
+
 
 	"github.com/cbergoon/merkletree"
 	"github.com/davecgh/go-spew/spew"
@@ -197,16 +204,26 @@ func CreateWallet() (Wallet, error) {
 	return w, nil
 }
 
-func (tx Transaction) ValidateTransaction() bool {
+func (tx Transaction) ValidateTransaction() (bool) {
 	signatureString := tx.Signature
-	signatureBytes, err := hex.DecodeString(signatureString)
+	signatureBytes,err := hex.DecodeString(signatureString)
 	if err != nil {
 		panic(err)
 	}
 	signature := ECDSASignature{}
-	_, err = asn1.Unmarshal(signatureBytes, &signature)
+	_,err = asn1.Unmarshal(signatureBytes, &signature)
 
-	hash, err := hex.DecodeString(tx.Number)
+	msg := tx.Input.InputString() + tx.Output.OutputString() 
+	hash := sha256.Sum256([]byte(msg))
+	if err != nil {
+		panic(err)
+	}
+
+	log.Println("SIGN")
+	log.Println(signature.R,signature.S)
+	log.Println("HASH")
+	log.Println(hash)
+
 
 	verificationKey := tx.RetrievePublicKey()
 	valid := ecdsa.Verify(verificationKey, hash[:], signature.R, signature.S)
@@ -516,13 +533,13 @@ func handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, r, http.StatusCreated, response)
 }
 
-func GenesisTransaction(ietf Wallet) Transaction {
+func GenesisTransaction(keystring string) Transaction {
 	var gtx Transaction
 	gtx.Input = []TransactionInput{}
 	gtx.Output = []TransactionOutput{
-		TransactionOutput{ietf.GetPublicString(), ".com", "9.9.9.9"},
-		TransactionOutput{ietf.GetPublicString(), ".gov", "8.8.8.8"},
-		TransactionOutput{ietf.GetPublicString(), ".org", "7.7.7.7"},
+		TransactionOutput{keystring, ".com", "9.9.9.9"},
+		TransactionOutput{keystring, ".gov", "8.8.8.8"},
+		TransactionOutput{keystring, ".org", "7.7.7.7"},
 	}
 	msg := gtx.Input.InputString() + gtx.Output.OutputString()
 	hash := sha256.Sum256([]byte(msg))
@@ -543,20 +560,47 @@ func makeMuxRouter() http.Handler {
 	return muxRouter
 }
 
+type WalletFile struct {
+	Name 				string
+	PrivateKeyString 	string
+	PublicKeyString 	string
+}
+
+
+
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	IETF, err := CreateWallet()
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
 		panic(err)
 	}
+	err = client.Ping(context.TODO(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Connected to MongoDB")
+
+	collection := client.Database("test").Collection("users")
+
+
+	var result WalletFile
+	filter := bson.D{{"name","IETF"}}
+	err = collection.FindOne(context.TODO(), filter).Decode(&result)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+
 
 	go func() {
 		t := time.Now()
-		genesisBlock := Block{0, t.String(), GenesisTransaction(IETF), "", "", difficulty, 0.0}
+		genesisBlock := Block{0, t.String(), GenesisTransaction(result.PublicKeyString), "", "", difficulty, 0.0}
 		spew.Dump(genesisBlock)
 		Blockchain = append(Blockchain, genesisBlock)
 		for _, gensisOutput := range genesisBlock.Tx.Output {
@@ -574,3 +618,4 @@ func main() {
 	log.Fatal(run())
 
 }
+
